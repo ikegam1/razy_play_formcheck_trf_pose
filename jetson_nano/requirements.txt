@@ -1,0 +1,4 @@
+# Jetsonプリインストールの OpenCV や公式whlで入れる PyTorch / torchvision / torch2trt 以外の
+# pipでインストール可能な軽量依存パッケージ一諸
+
+Pillow>=8.0.0

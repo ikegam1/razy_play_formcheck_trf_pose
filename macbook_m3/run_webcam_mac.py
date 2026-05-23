@@ -41,65 +41,85 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
 
 # --- 状態管理変数 ---
-frame_buffer = deque()       
-is_playback = False          
-playback_frames = []         
-playback_index = 0           
-playback_seconds = 0  
+frame_buffer = deque()            # 過去映像ストック用バッファ（最大120秒）
+is_playback = False               # 遅延再生中フラグ
+playback_remaining_time = 0.0     # 【修正】遅延の残り秒数（カウントダウン用）
+playback_anchor_time = 0.0        # 【新設】遅延開始時の基準システム時刻
 
-is_recording = False  
-video_writer = None   
-rec_start_time = 0.0  
+is_recording = False              # 録画中フラグ
+video_writer = None               # 動画書き込み用オブジェクト
+rec_start_time = 0.0              # 録画開始時間
 
-# 実測FPS計測用のバッファ（直近30フレームの時間を記録）
+# 実測FPS計測用
 fps_timestamps = deque(maxlen=30)
 current_fps = 30.0
 
 # UIボタン配置 (x1, x2, アクション種別, 設定値, ラベル)
 BUTTONS = [
-    (10, 110, "timeshift", 10, "< 10s"),
-    (120, 220, "timeshift", 20, "< 20s"),
-    (230, 330, "timeshift", 30, "< 30s"),
-    (360, 460, "rec_start", None, "REC"),
-    (470, 570, "rec_stop", None, "STOP")
+    (10, 90,   "sub",   2,  "< 2s"),
+    (100, 180, "sub",   5,  "< 5s"),
+    (190, 270, "sub",   10, "< 10s"),
+    (280, 360, "sub",   30, "< 30s"),
+    (370, 450, "add",   5,  "5s >"),
+    (460, 540, "add",   1,  "1s >"),
+    (550, 630, "reset", None, "LIVE"), # ↩ボタンの代用（通常再生リセット）
+    (660, 740, "rec_start", None, "REC"),
+    (750, 830, "rec_stop", None, "STOP")
 ]
 
 # マウスクリックイベントの処理
 def on_mouse_click(event, x, y, flags, param):
-    global is_playback, playback_frames, playback_index, frame_buffer, playback_seconds
-    global is_recording, video_writer, rec_start_time, current_fps
+    global is_playback, frame_buffer, playback_remaining_time, playback_anchor_time
+    global is_recording, video_writer, rec_start_time
     
     if event == cv2.EVENT_LBUTTONDOWN:
         if 10 <= y <= 50:
+            current_time = time.time()
             for x1, x2, btn_type, val, label in BUTTONS:
                 if x1 <= x <= x2:
-                    # 1. タイムシフト再生ボタン
-                    if btn_type == "timeshift":
-                        if not is_playback and len(frame_buffer) > 0:
-                            print(f"\n[INFO] {val}秒前からの遅延再生を開始します...")
-                            current_time = time.time()
-                            target_time = current_time - val
-                            playback_frames = [f for t, f in frame_buffer if t >= target_time]
-                            playback_index = 0
-                            playback_seconds = val
+                    # 1. 過去に巻き戻すボタン（遅延残り時間を加算）
+                    if btn_type == "sub":
+                        if not is_playback:
                             is_playback = True
+                            playback_anchor_time = current_time
+                            playback_remaining_time = float(val)
+                        else:
+                            playback_remaining_time += float(val)
+                        
+                        if playback_remaining_time > 120.0:
+                            playback_remaining_time = 120.0  # 上限120秒ガード
+                        print(f"[INFO] 遅延残り時間を変更: {playback_remaining_time:.1f}秒")
                     
-                    # 2. 録画開始ボタン
+                    # 2. 未来に進めるボタン（遅延残り時間を減算）
+                    elif btn_type == "add":
+                        if is_playback:
+                            playback_remaining_time -= float(val)
+                            if playback_remaining_time <= 0:
+                                is_playback = False
+                                playback_remaining_time = 0.0
+                                print("[INFO] 通常再生（ライブ）に戻りました。")
+                            else:
+                                print(f"[INFO] 遅延残り時間を変更: {playback_remaining_time:.1f}秒")
+                    
+                    # 3. LIVE（↩）ボタン：通常再生にリセット
+                    elif btn_type == "reset":
+                        is_playback = False
+                        playback_remaining_time = 0.0
+                        print("[INFO] 通常再生（ライブ）に戻りました。")
+                    
+                    # 4. 録画開始ボタン
                     elif btn_type == "rec_start":
                         if not is_recording:
                             is_recording = True
-                            rec_start_time = time.time()
+                            rec_start_time = current_time
                             filename = f"pose_rec_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
                             
-                            # 【修正】現在の「実測FPS」をそのまま動画のフレームレートとして採用
-                            # 異常値対策として下限10、上限60の安全ガードを設置
                             video_fps = max(10.0, min(60.0, current_fps))
-                            
                             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                             video_writer = cv2.VideoWriter(filename, fourcc, video_fps, (WIDTH, HEIGHT))
                             print(f"\n[INFO] 録画を開始しました (設定FPS: {video_fps:.1f}): {filename}")
                     
-                    # 3. 録画停止ボタン
+                    # 5. 録画停止ボタン
                     elif btn_type == "rec_stop":
                         if is_recording:
                             is_recording = False
@@ -113,7 +133,9 @@ WINDOW_NAME = 'mac_pose_timeshift'
 cv2.namedWindow(WINDOW_NAME)
 cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
 
-print("Starting live inference. Press 'q' to quit.")
+print("Starting live inference. Press 'q' to quit, 'ESC' or 'BackSpace' to return to Live.")
+last_time = time.time()
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
@@ -121,8 +143,10 @@ while cap.isOpened():
         break
         
     current_time = time.time()
+    dt = current_time - last_time  # 前回のループからの経過時間を計算
+    last_time = current_time
     
-    # 【新機能】実測FPSの計算（直近30コマの処理速度からリアルタイム算出）
+    # 実測FPSの計算
     fps_timestamps.append(current_time)
     if len(fps_timestamps) > 1:
         total_time = fps_timestamps[-1] - fps_timestamps[0]
@@ -154,29 +178,49 @@ while cap.isOpened():
                 if 0 <= cx < WIDTH and 0 <= cy < HEIGHT:
                     cv2.circle(display_frame, (cx, cy), 4, (0, 255, 0), -1)
                     
-    # 録画処理：実測FPSと同じペースで「最新のライブ映像」を裏で書き込み続ける
+    # 【録画】裏で常に最新映像（骨格描画済み）を保存
     if is_recording and video_writer is not None:
         video_writer.write(display_frame)
                     
-    # 過去30秒のライブフレームを常時バッファにストック
+    # 【大容量化】過去「120秒間」のライブフレームをバッファに常時ストック
     frame_buffer.append((current_time, display_frame.copy()))
-    while frame_buffer and (current_time - frame_buffer[0][0] > 30.0):
+    while frame_buffer and (current_time - frame_buffer[0][0] > 120.0):
         frame_buffer.popleft()
         
-    # メイン画面に出力するベースフレームの決定
+    # 【修正】遅延再生中のカウントダウンおよびフレーム検索処理
     if is_playback:
-        if playback_index < len(playback_frames):
-            out_frame = playback_frames[playback_index].copy()
-            playback_index += 1
-            cv2.putText(out_frame, f"-{playback_seconds}sec PLAYBACK", (WIDTH - 260, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        else:
-            print("[INFO] 遅延再生が終了しました。ライブに戻ります。")
+        playback_remaining_time -= dt  # 時間の経過とともに残り秒数を減らす
+        
+        if playback_remaining_time <= 0:
             is_playback = False
+            playback_remaining_time = 0.0
+            print("[INFO] 再生が最新に追いついたため、通常再生（ライブ）に戻ります。")
             out_frame = display_frame.copy()
+        else:
+            # ターゲットとする過去の絶対時刻を割り出す
+            target_time = playback_anchor_time - playback_remaining_time
+            best_frame = None
+            
+            # 時系列バッファを最新から過去へ逆引き検索し、目標時刻に最も近いコマを特定
+            for t, f in reversed(frame_buffer):
+                if t <= target_time:
+                    best_frame = f
+                    break
+            
+            if best_frame is None and len(frame_buffer) > 0:
+                best_frame = frame_buffer[0][1]
+                
+            if best_frame is not None:
+                out_frame = best_frame.copy()
+                # 綺麗にカウントダウンさせるため、残り秒数を切り上げて整数表記
+                display_sec = int(np.ceil(playback_remaining_time))
+                cv2.putText(out_frame, f"-{display_sec}sec PLAYBACK", (WIDTH - 280, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            else:
+                out_frame = display_frame.copy()
     else:
         out_frame = display_frame.copy()
         
-    # 録画時間表示ロジック
+    # 録画時間表示
     if is_recording:
         elapsed_time = current_time - rec_start_time
         rec_min = int(elapsed_time // 60)
@@ -188,9 +232,12 @@ while cap.isOpened():
         if btn_type == "rec_start" and is_recording:
             bg_color = (0, 0, 255)       
             text_color = (255, 255, 255)
-        elif btn_type == "timeshift" and is_playback and val == playback_seconds:
-            bg_color = (0, 165, 255)     
+        elif btn_type == "reset" and is_playback:
+            bg_color = (0, 200, 0)       # 遅延再生中はLIVEボタンを緑に
             text_color = (255, 255, 255)
+        elif btn_type == "add" and not is_playback:
+            bg_color = (180, 180, 180)   # ライブ中は「未来に進む」ボタンを無効化（グレー）
+            text_color = (120, 120, 120)
         else:
             bg_color = (220, 220, 220)   
             text_color = (0, 0, 0)
@@ -198,15 +245,28 @@ while cap.isOpened():
         cv2.rectangle(out_frame, (x1, 10), (x2, 50), bg_color, -1)
         cv2.rectangle(out_frame, (x1, 10), (x2, 50), (100, 100, 100), 2)
         
-        offset_x = 12 if "s" in label or "STOP" in label else 25
+        if len(label) == 3:
+            offset_x = 22
+        elif len(label) == 4:
+            offset_x = 16
+        else:
+            offset_x = 10
         cv2.putText(out_frame, label, (x1 + offset_x, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
     
-    # 【新機能】現在の動作FPSを画面右下にさりげなく表示
+    # 動作FPS表示
     cv2.putText(out_frame, f"FPS: {current_fps:.1f}", (WIDTH - 120, HEIGHT - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     cv2.imshow(WINDOW_NAME, out_frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    
+    # 【新機能】キーボード入力処理
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    # ESCキー (27) または BackSpace/Deleteキー (8 または Mac用127) で通常（LIVE）に戻る
+    elif key in [27, 8, 127]:
+        is_playback = False
+        playback_remaining_time = 0.0
+        print("[INFO] キーボード入力により通常再生（ライブ）に戻りました。")
 
 cap.release()
 if video_writer is not None:

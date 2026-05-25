@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Mölkky Live DVR</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: #fff;
+      font-family: system-ui, sans-serif;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+    }
+    main { width: min(100vw, 1280px); }
+    video { width: 100%; background: #000; display: block; }
+    .controls {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px;
+      background: #1b1b1b;
+    }
+    button {
+      padding: 8px 12px;
+      border: 1px solid #555;
+      background: #2a2a2a;
+      color: #fff;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover { background: #3a3a3a; }
+    input[type="range"] { width: 100%; }
+    #status {
+      font-size: 13px;
+      opacity: 0.85;
+      padding: 8px 10px;
+      word-break: break-all;
+      background: #111;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <!-- 自動再生はブラウザ仕様上、ミュートが必要です。音声は「音声ON」で有効化します。 -->
+    <video id="video" controls autoplay muted playsinline></video>
+
+    <div class="controls">
+      <button id="back30">-30秒</button>
+      <input id="seek" type="range" min="0" max="1000" value="1000" step="1">
+      <button id="live">最新へ</button>
+    </div>
+
+    <div class="controls">
+      <button id="back10">-10秒</button>
+      <button id="forward10">+10秒</button>
+      <button id="sound">音声ON</button>
+      <span id="timeLabel">--:-- / --:--</span>
+    </div>
+
+    <div id="status">loading...</div>
+  </main>
+
+  <!-- CDNではなく、Pagesに同梱したローカルファイルを読む -->
+  <script src="./hls.min.js"></script>
+
+  <script>
+    const src = "https://pub-9d9710ab45014df8b3db7b6fa45b8307.r2.dev/live/stream.m3u8";
+
+    const video = document.getElementById("video");
+    const statusEl = document.getElementById("status");
+    const seek = document.getElementById("seek");
+    const timeLabel = document.getElementById("timeLabel");
+
+    let seekingByUser = false;
+
+    function log(message) {
+      console.log(message);
+      statusEl.textContent = message;
+    }
+
+    function fmt(sec) {
+      if (!Number.isFinite(sec)) return "--:--";
+      sec = Math.max(0, Math.floor(sec));
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return `${m}:${String(s).padStart(2, "0")}`;
+    }
+
+    function getSeekableRange() {
+      if (!video.seekable || video.seekable.length === 0) return null;
+      const start = video.seekable.start(0);
+      const end = video.seekable.end(video.seekable.length - 1);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+      return { start, end };
+    }
+
+    function updateSeekBar() {
+      const r = getSeekableRange();
+      if (!r) {
+        timeLabel.textContent = "--:-- / --:--";
+        return;
+      }
+
+      const pos = Math.min(Math.max(video.currentTime, r.start), r.end);
+      const value = ((pos - r.start) / (r.end - r.start)) * 1000;
+
+      if (!seekingByUser) seek.value = String(Math.round(value));
+
+      const behindLive = Math.max(0, r.end - video.currentTime);
+      timeLabel.textContent =
+        `${fmt(pos - r.start)} / ${fmt(r.end - r.start)}  最新から ${fmt(behindLive)} 遅れ`;
+    }
+
+    function seekRelative(delta) {
+      const r = getSeekableRange();
+      if (!r) return;
+      video.currentTime = Math.min(Math.max(video.currentTime + delta, r.start), r.end - 0.5);
+      updateSeekBar();
+    }
+
+    function jumpToLiveEdge() {
+      const r = getSeekableRange();
+      if (!r) return;
+      video.currentTime = Math.max(r.start, r.end - 1.0);
+      video.play().catch(() => {});
+      updateSeekBar();
+    }
+
+    document.getElementById("back30").addEventListener("click", () => seekRelative(-30));
+    document.getElementById("back10").addEventListener("click", () => seekRelative(-10));
+    document.getElementById("forward10").addEventListener("click", () => seekRelative(10));
+    document.getElementById("live").addEventListener("click", jumpToLiveEdge);
+
+    document.getElementById("sound").addEventListener("click", () => {
+      video.muted = false;
+      video.volume = 1.0;
+      video.play().catch(() => {});
+      log("音声ON。ブラウザでブロックされた場合は動画の再生ボタンを押してください。");
+    });
+
+    seek.addEventListener("input", () => {
+      seekingByUser = true;
+      const r = getSeekableRange();
+      if (!r) return;
+      const ratio = Number(seek.value) / 1000;
+      video.currentTime = r.start + (r.end - r.start) * ratio;
+      updateSeekBar();
+    });
+
+    seek.addEventListener("change", () => {
+      seekingByUser = false;
+      video.play().catch(() => {});
+    });
+
+    video.defaultPlaybackRate = 1.0;
+    video.playbackRate = 1.0;
+    video.addEventListener("ratechange", () => {
+      if (video.playbackRate !== 1.0) video.playbackRate = 1.0;
+    });
+
+    setInterval(updateSeekBar, 500);
+
+    function startPlayback() {
+      video.play().catch(() => {
+        log("自動再生がブロックされました。再生ボタンを押してください。");
+      });
+    }
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = src;
+      video.addEventListener("loadedmetadata", startPlayback, { once: true });
+      log("Native HLS loaded.");
+    } else if (window.Hls && Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: false,
+        lowLatencyMode: false,
+        maxLiveSyncPlaybackRate: 1.0,
+        liveSyncDuration: 12,
+        liveMaxLatencyDuration: 120,
+        maxBufferLength: 60,
+        maxMaxBufferLength: 120,
+        backBufferLength: 180,
+        manifestLoadingTimeOut: 20000,
+        fragLoadingTimeOut: 20000,
+        manifestLoadingMaxRetry: 10,
+        fragLoadingMaxRetry: 10,
+        manifestLoadingRetryDelay: 1000,
+        fragLoadingRetryDelay: 1000
+      });
+
+      hls.on(Hls.Events.ERROR, function (_event, data) {
+        console.warn("HLS error", data);
+        log("HLS error: " + data.type + " / " + data.details);
+        if (data.fatal) {
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            hls.startLoad();
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+          } else {
+            hls.destroy();
+          }
+        }
+      });
+
+      hls.on(Hls.Events.MANIFEST_PARSED, function () {
+        log("Manifest loaded. 自動再生を開始します。音声は音声ONボタンで有効化してください。");
+        startPlayback();
+      });
+
+      hls.on(Hls.Events.FRAG_LOADED, function (_event, data) {
+        if (data.frag && data.frag.relurl) {
+          log("Loaded: " + data.frag.relurl);
+        }
+      });
+
+      hls.on(Hls.Events.LEVEL_UPDATED, updateSeekBar);
+
+      hls.loadSource(src);
+      hls.attachMedia(video);
+    } else {
+      log("このブラウザはHLS再生に対応していません。");
+    }
+  </script>
+</body>
+</html>

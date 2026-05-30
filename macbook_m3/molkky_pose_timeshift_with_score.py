@@ -59,10 +59,30 @@ AUDIO_CODEC = "aac"
 
 # HLS配信では音声トラックの負荷とタイムスタンプずれが固まりの原因になりやすいため、
 # まずは低レート・モノラルで安定性を優先します。
-AUDIO_BITRATE = os.environ.get("MOLKKY_AUDIO_BITRATE", "32k")
-AUDIO_SAMPLE_RATE = os.environ.get("MOLKKY_AUDIO_SAMPLE_RATE", "8000")
+AUDIO_BITRATE = os.environ.get("MOLKKY_AUDIO_BITRATE", "48k")
+# 8000Hz AACはPCでは動いてもスマホ側で止まりやすいことがあるため、
+# モバイル互換性を優先して 22050Hz mono をデフォルトにします。
+AUDIO_SAMPLE_RATE = os.environ.get("MOLKKY_AUDIO_SAMPLE_RATE", "22050")
 AUDIO_CHANNELS = os.environ.get("MOLKKY_AUDIO_CHANNELS", "1")
 AUDIO_FILTER = f"aresample=async=1:first_pts=0"
+
+# --- YouTube Live配信設定 ---
+# YouTube Liveへ同じ合成済み映像をRTMPS/RTMPで送信します。
+# 有効化例:
+#   YOUTUBE_LIVE_ENABLED=1 \
+#   YOUTUBE_STREAM_URL="rtmps://a.rtmps.youtube.com/live2" \
+#   YOUTUBE_STREAM_KEY="xxxx-xxxx-xxxx-xxxx-xxxx" \
+#   python3 molkky_pose_timeshift_with_score_v14.py
+YOUTUBE_LIVE_ENABLED = os.environ.get("YOUTUBE_LIVE_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+YOUTUBE_STREAM_URL = os.environ.get("YOUTUBE_STREAM_URL", "rtmps://a.rtmps.youtube.com/live2")
+YOUTUBE_STREAM_KEY = os.environ.get("YOUTUBE_STREAM_KEY", "")
+# YOUTUBE_RTMP_URL を指定した場合は、URLとキーを結合せず、その値をそのまま使います。
+YOUTUBE_RTMP_URL = os.environ.get("YOUTUBE_RTMP_URL", "")
+YOUTUBE_FPS = int(os.environ.get("YOUTUBE_FPS", str(HLS_FPS)))
+YOUTUBE_VIDEO_BITRATE = os.environ.get("YOUTUBE_VIDEO_BITRATE", "2500k")
+YOUTUBE_MAXRATE = os.environ.get("YOUTUBE_MAXRATE", YOUTUBE_VIDEO_BITRATE)
+YOUTUBE_BUFSIZE = os.environ.get("YOUTUBE_BUFSIZE", "5000k")
+YOUTUBE_AUDIO_ENABLED = os.environ.get("YOUTUBE_AUDIO_ENABLED", "1").lower() not in ("0", "false", "no", "off")
 
 hls_process = None
 hls_warned = False
@@ -73,6 +93,13 @@ hls_thread = None
 hls_stop_event = None
 hls_latest_frame = None
 hls_frame_lock = threading.Lock()
+
+youtube_process = None
+youtube_thread = None
+youtube_stop_event = None
+youtube_latest_frame = None
+youtube_frame_lock = threading.Lock()
+youtube_warned = False
 
 score_data_cache = {
     "players": []
@@ -542,6 +569,7 @@ def start_recording_writer(filename, video_fps):
             cmd += [
                 "-af", AUDIO_FILTER,
                 "-c:a", AUDIO_CODEC,
+                "-profile:a", "aac_low",
                 "-b:a", AUDIO_BITRATE,
                 "-ar", AUDIO_SAMPLE_RATE,
                 "-ac", AUDIO_CHANNELS,
@@ -674,6 +702,7 @@ def start_hls_writer():
         cmd += [
             "-af", AUDIO_FILTER,
             "-c:a", AUDIO_CODEC,
+            "-profile:a", "aac_low",
             "-b:a", AUDIO_BITRATE,
             "-ar", AUDIO_SAMPLE_RATE,
             "-ac", AUDIO_CHANNELS,
@@ -763,8 +792,9 @@ def update_hls_latest_frame(frame):
 
 
 def write_hls_frame_realtime(frame, now=None):
-    """互換用。v9では専用スレッドへ最新フレームを渡すだけ。"""
+    """互換用。配信用スレッドへ最新フレームを渡す。"""
     update_hls_latest_frame(frame)
+    update_youtube_latest_frame(frame)
 
 
 def stop_hls_writer():
@@ -795,6 +825,188 @@ def stop_hls_writer():
     hls_process = None
 
 
+def build_youtube_output_url():
+    """YouTube Live送信用URLを組み立てる。"""
+    if YOUTUBE_RTMP_URL:
+        return YOUTUBE_RTMP_URL
+    if not YOUTUBE_STREAM_KEY:
+        return ""
+    return YOUTUBE_STREAM_URL.rstrip("/") + "/" + YOUTUBE_STREAM_KEY.strip()
+
+
+def start_youtube_writer():
+    """YouTube LiveへRTMP/RTMPS送信するffmpegプロセスを開始する。"""
+    global youtube_process, youtube_thread, youtube_stop_event, youtube_latest_frame, youtube_warned
+
+    youtube_latest_frame = None
+
+    if not YOUTUBE_LIVE_ENABLED:
+        return None
+
+    output_url = build_youtube_output_url()
+    if not output_url:
+        print("[WARN] YouTube Liveが有効ですが、YOUTUBE_STREAM_KEY または YOUTUBE_RTMP_URL が未設定です。YouTube送信を無効化します。")
+        return None
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        if not youtube_warned:
+            print("[WARN] ffmpeg が見つからないためYouTube Live出力を無効化します。")
+            youtube_warned = True
+        return None
+
+    cmd = [
+        ffmpeg_path,
+        "-loglevel", "warning",
+        "-y",
+        "-thread_queue_size", "1024",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{WIDTH}x{HEIGHT}",
+        "-r", str(YOUTUBE_FPS),
+        "-i", "-",
+    ]
+
+    if AUDIO_ENABLED and YOUTUBE_AUDIO_ENABLED:
+        cmd += [
+            "-thread_queue_size", "1024",
+            "-f", "avfoundation",
+            "-i", AUDIO_INPUT,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+        ]
+    else:
+        cmd += ["-map", "0:v:0"]
+
+    keyframe_interval = max(1, YOUTUBE_FPS * 2)  # YouTube推奨に合わせて約2秒GOP
+    cmd += [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
+        "-r", str(YOUTUBE_FPS),
+        "-g", str(keyframe_interval),
+        "-keyint_min", str(keyframe_interval),
+        "-sc_threshold", "0",
+        "-b:v", YOUTUBE_VIDEO_BITRATE,
+        "-maxrate", YOUTUBE_MAXRATE,
+        "-bufsize", YOUTUBE_BUFSIZE,
+    ]
+
+    if AUDIO_ENABLED and YOUTUBE_AUDIO_ENABLED:
+        cmd += [
+            "-af", AUDIO_FILTER,
+            "-c:a", AUDIO_CODEC,
+            "-profile:a", "aac_low",
+            "-b:a", AUDIO_BITRATE,
+            "-ar", AUDIO_SAMPLE_RATE,
+            "-ac", AUDIO_CHANNELS,
+        ]
+    else:
+        cmd += ["-an"]
+
+    cmd += [
+        "-f", "flv",
+        "-flvflags", "no_duration_filesize",
+        output_url,
+    ]
+
+    try:
+        youtube_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        youtube_stop_event = threading.Event()
+        youtube_thread = threading.Thread(target=youtube_frame_publisher, daemon=True)
+        youtube_thread.start()
+        safe_url = output_url.rsplit("/", 1)[0] + "/********" if "/" in output_url else "********"
+        print(f"[INFO] YouTube Live出力を開始しました: {safe_url} ({YOUTUBE_FPS}fps, {YOUTUBE_VIDEO_BITRATE}, 音声: {'有効' if AUDIO_ENABLED and YOUTUBE_AUDIO_ENABLED else '無効'})")
+    except Exception as e:
+        print(f"[WARN] YouTube Live出力を開始できませんでした: {e}")
+        youtube_process = None
+
+    return youtube_process
+
+
+def write_youtube_frame_raw(frame):
+    """YouTube出力へ1フレームを書き込む。失敗時は自動停止。"""
+    global youtube_process
+    if youtube_process is None or youtube_process.stdin is None:
+        return False
+    try:
+        youtube_process.stdin.write(frame.tobytes())
+        return True
+    except (BrokenPipeError, OSError) as e:
+        print(f"[WARN] YouTube Live出力が停止しました: {e}")
+        try:
+            youtube_process.stdin.close()
+        except Exception:
+            pass
+        youtube_process = None
+        return False
+
+
+def youtube_frame_publisher():
+    """最新フレームをYouTube用ffmpegへ一定FPSで送り続ける。"""
+    global youtube_process
+
+    interval = 1.0 / float(max(1, YOUTUBE_FPS))
+    next_time = time.monotonic()
+    last_frame = None
+
+    while youtube_stop_event is not None and not youtube_stop_event.is_set():
+        now = time.monotonic()
+        if now < next_time:
+            time.sleep(min(0.01, next_time - now))
+            continue
+
+        with youtube_frame_lock:
+            if youtube_latest_frame is not None:
+                last_frame = youtube_latest_frame.copy()
+
+        if last_frame is not None:
+            if not write_youtube_frame_raw(last_frame):
+                return
+
+        next_time += interval
+        if time.monotonic() - next_time > 1.0:
+            next_time = time.monotonic() + interval
+
+
+def update_youtube_latest_frame(frame):
+    """メインループからYouTube出力用の最新フレームを共有する。"""
+    global youtube_latest_frame
+    if youtube_process is None:
+        return
+    with youtube_frame_lock:
+        youtube_latest_frame = frame.copy()
+
+
+def stop_youtube_writer():
+    """YouTube Live用ffmpegと送信スレッドを停止する。"""
+    global youtube_process, youtube_stop_event, youtube_thread
+
+    if youtube_stop_event is not None:
+        youtube_stop_event.set()
+
+    if youtube_thread is not None and youtube_thread.is_alive():
+        try:
+            youtube_thread.join(timeout=1.5)
+        except Exception:
+            pass
+    youtube_thread = None
+
+    if youtube_process is not None:
+        try:
+            if youtube_process.stdin:
+                youtube_process.stdin.close()
+            youtube_process.wait(timeout=3)
+        except Exception:
+            try:
+                youtube_process.terminate()
+                youtube_process.wait(timeout=1)
+            except Exception:
+                pass
+    youtube_process = None
+
+
 def cleanup_hls_runtime_files():
     """次回起動時に古いアップロード状態やHLS断片が残らないよう掃除する。"""
     try:
@@ -823,6 +1035,7 @@ def cleanup_hls_runtime_files():
 def shutdown_cleanup():
     """アプリ終了時の共通クリーンアップ。"""
     stop_recording_writer()
+    stop_youtube_writer()
     stop_hls_writer()
     cleanup_hls_runtime_files()
 
@@ -833,6 +1046,7 @@ cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
 print("Starting live inference. Press 'q' to quit, 'ESC' or 'BackSpace' to return to Live.")
 print(f"[INFO] スコア表示ファイル: {SCORE_FILE}")
 print(f"[INFO] 音声入力: {'有効 ' + AUDIO_INPUT if AUDIO_ENABLED else '無効'}")
+print(f"[INFO] YouTube Live: {'有効' if YOUTUBE_LIVE_ENABLED else '無効'}")
 if not PIL_AVAILABLE:
     print("[WARN] Pillowが無いため日本語表示は?になります: python3 -m pip install pillow")
 elif JP_FONT_PATH is None:
@@ -851,6 +1065,7 @@ for _sig in (signal.SIGINT, signal.SIGTERM):
         pass
 
 start_hls_writer()
+start_youtube_writer()
 last_time = time.time()
 
 while cap.isOpened():
@@ -947,6 +1162,11 @@ while cap.isOpened():
         rec_min = int(elapsed_time // 60)
         rec_sec = int(elapsed_time % 60)
         cv2.putText(out_frame, f"REC {rec_min:02d}:{rec_sec:02d}", (WIDTH - 180, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+    # YouTube Live送信状態表示
+    if YOUTUBE_LIVE_ENABLED:
+        yt_color = (0, 0, 255) if youtube_process is not None else (80, 80, 80)
+        cv2.putText(out_frame, "YT LIVE" if youtube_process is not None else "YT OFF", (WIDTH - 270, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, yt_color, 2)
 
     # UIボタンの描画処理
     for x1, x2, btn_type, val, label in BUTTONS:
